@@ -1,0 +1,17 @@
+# Build outputs
+.next/
+out/
+build/
+
+# Dependencies
+node_modules/
+
+# Environment files
+.env*
+
+# Testing outputs
+coverage/
+
+# Config files that don't need linting
+*.config.js
+*.config.mjs

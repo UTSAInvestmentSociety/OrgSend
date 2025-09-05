@@ -1,0 +1,315 @@
+/**
+ * Prisma middleware for transparent PII encryption/decryption
+ * Automatically encrypts PII fields on create/update and decrypts on read operations
+ */
+
+import { Prisma } from "../../generated/prisma";
+import { encrypt, decrypt, encryptBatch, decryptBatch } from "./crypto";
+import { createUniqueConstraintHash } from "./hash";
+import {
+  getEncryptionKey,
+  getNamesKey,
+  getPhoneKey,
+  getEmailKey,
+} from "./keys";
+import {
+  PII_FIELD_MAPPINGS,
+  EncryptedFieldMapping,
+  EncryptionError,
+  DecryptionError,
+  BATCH_LIMITS,
+  EncryptionKeyPath,
+  ENCRYPTION_KEY_PATHS,
+} from "./types";
+
+// Cache for encryption keys to avoid repeated AWS calls
+const keyCache = new Map<EncryptionKeyPath, Buffer>();
+
+/**
+ * Gets the appropriate encryption key for a field type
+ * @param keyPath - The key path for the field type
+ * @returns Promise<Buffer> - The encryption key
+ */
+async function getKeyForField(keyPath: EncryptionKeyPath): Promise<Buffer> {
+  // Check cache first
+  const cachedKey = keyCache.get(keyPath);
+  if (cachedKey) {
+    return cachedKey;
+  }
+
+  // Get key from AWS Secrets Manager
+  let encryptionKey: Buffer;
+
+  switch (keyPath) {
+    case ENCRYPTION_KEY_PATHS.NAMES:
+      const namesKey = await getNamesKey();
+      encryptionKey = namesKey.key;
+      break;
+    case ENCRYPTION_KEY_PATHS.PHONE:
+      const phoneKey = await getPhoneKey();
+      encryptionKey = phoneKey.key;
+      break;
+    case ENCRYPTION_KEY_PATHS.EMAIL:
+      const emailKey = await getEmailKey();
+      encryptionKey = emailKey.key;
+      break;
+    default:
+      throw new EncryptionError(`Unknown key path: ${keyPath}`);
+  }
+
+  // Cache for future use
+  keyCache.set(keyPath, encryptionKey);
+
+  return encryptionKey;
+}
+
+/**
+ * Encrypts a single PII field and generates its hash
+ * @param fieldName - Name of the field to encrypt
+ * @param value - The plaintext value to encrypt
+ * @returns Promise<{encryptedField: string, hashField: string}> - Encrypted and hashed values
+ */
+async function encryptField(
+  fieldName: string,
+  value: string
+): Promise<{
+  encryptedField: string;
+  hashField: string;
+}> {
+  const mapping = PII_FIELD_MAPPINGS[fieldName];
+  if (!mapping) {
+    throw new EncryptionError(
+      `No encryption mapping found for field: ${fieldName}`
+    );
+  }
+
+  // Get the appropriate encryption key
+  const key = await getKeyForField(mapping.keyPath);
+
+  // Encrypt the value
+  const encryptionResult = encrypt(value, key);
+
+  // Create a combined encrypted string with IV and auth tag
+  const encryptedValue = JSON.stringify({
+    data: encryptionResult.encrypted,
+    iv: encryptionResult.iv,
+    tag: encryptionResult.authTag,
+  });
+
+  // Generate hash for unique constraints and lookups
+  const hash = createUniqueConstraintHash(value);
+
+  return {
+    encryptedField: encryptedValue,
+    hashField: hash,
+  };
+}
+
+/**
+ * Decrypts a single encrypted PII field
+ * @param fieldName - Name of the field to decrypt
+ * @param encryptedValue - The encrypted value string
+ * @returns Promise<string> - The decrypted plaintext value
+ */
+async function decryptField(
+  fieldName: string,
+  encryptedValue: string
+): Promise<string> {
+  const mapping = PII_FIELD_MAPPINGS[fieldName];
+  if (!mapping) {
+    throw new DecryptionError(
+      `No encryption mapping found for field: ${fieldName}`
+    );
+  }
+
+  try {
+    // Parse the encrypted value JSON
+    const parsedValue = JSON.parse(encryptedValue);
+
+    if (!parsedValue.data || !parsedValue.iv || !parsedValue.tag) {
+      throw new DecryptionError(
+        `Invalid encrypted value format for field: ${fieldName}`
+      );
+    }
+
+    // Get the appropriate decryption key
+    const key = await getKeyForField(mapping.keyPath);
+
+    // Decrypt the value
+    const decryptionInput = {
+      encrypted: parsedValue.data,
+      iv: parsedValue.iv,
+      authTag: parsedValue.tag,
+    };
+
+    return decrypt(decryptionInput, key);
+  } catch (error) {
+    if (error instanceof DecryptionError) {
+      throw error;
+    }
+    throw new DecryptionError(
+      `Failed to decrypt field ${fieldName}`,
+      error as Error
+    );
+  }
+}
+
+/**
+ * Processes create/update operations to encrypt PII fields
+ * @param params - Prisma middleware parameters
+ * @returns Promise<void> - Modifies params.args.data in place
+ */
+async function processCreateUpdate(
+  params: Prisma.MiddlewareParams
+): Promise<void> {
+  if (!params.args.data || typeof params.args.data !== "object") {
+    return;
+  }
+
+  const data = params.args.data as any;
+  const encryptionPromises: Array<Promise<void>> = [];
+
+  // Process each PII field that exists in the data
+  for (const [fieldName, mapping] of Object.entries(PII_FIELD_MAPPINGS)) {
+    if (data[fieldName] && typeof data[fieldName] === "string") {
+      const encryptionPromise = encryptField(fieldName, data[fieldName])
+        .then(({ encryptedField, hashField }) => {
+          // Set encrypted and hash fields
+          data[mapping.encryptedField] = encryptedField;
+          data[mapping.hashField] = hashField;
+
+          // Remove the plaintext field
+          delete data[fieldName];
+        })
+        .catch((error) => {
+          throw new EncryptionError(`Failed to encrypt ${fieldName}`, error);
+        });
+
+      encryptionPromises.push(encryptionPromise);
+    }
+  }
+
+  // Wait for all encryption operations to complete
+  await Promise.all(encryptionPromises);
+}
+
+/**
+ * Processes read operations to decrypt PII fields
+ * @param result - The result from the database query
+ * @returns Promise<any> - The result with decrypted fields
+ */
+async function processReadResult(result: any): Promise<any> {
+  if (!result) {
+    return result;
+  }
+
+  // Handle arrays of results (findMany)
+  if (Array.isArray(result)) {
+    if (result.length > BATCH_LIMITS.DECRYPTION) {
+      throw new DecryptionError(
+        `Result set too large for decryption: ${result.length} > ${BATCH_LIMITS.DECRYPTION}`
+      );
+    }
+
+    const decryptionPromises = result.map((item) => processReadResult(item));
+    return Promise.all(decryptionPromises);
+  }
+
+  // Handle single result objects
+  if (typeof result === "object" && result !== null) {
+    const decryptionPromises: Array<Promise<void>> = [];
+
+    // Process each PII field that has an encrypted counterpart
+    for (const [fieldName, mapping] of Object.entries(PII_FIELD_MAPPINGS)) {
+      const encryptedValue = result[mapping.encryptedField];
+
+      if (encryptedValue && typeof encryptedValue === "string") {
+        const decryptionPromise = decryptField(fieldName, encryptedValue)
+          .then((decryptedValue) => {
+            // Set the decrypted value on the original field name
+            result[fieldName] = decryptedValue;
+
+            // Optionally remove encrypted fields from result (uncomment if desired)
+            // delete result[mapping.encryptedField];
+            // delete result[mapping.hashField];
+          })
+          .catch((error) => {
+            // Log decryption errors but don't fail the entire query
+            console.error(`Failed to decrypt ${fieldName}:`, error.message);
+
+            // Set field to null or empty string if decryption fails
+            result[fieldName] = null;
+          });
+
+        decryptionPromises.push(decryptionPromise);
+      }
+    }
+
+    // Wait for all decryption operations to complete
+    await Promise.all(decryptionPromises);
+  }
+
+  return result;
+}
+
+/**
+ * Prisma middleware function for transparent encryption/decryption
+ * This function should be registered with prisma.$use()
+ */
+export const encryptionMiddleware: Prisma.Middleware = async (
+  params: Prisma.MiddlewareParams,
+  next: (params: Prisma.MiddlewareParams) => Promise<any>
+): Promise<any> => {
+  try {
+    // Handle create and update operations - encrypt PII before storage
+    if (
+      params.action === "create" ||
+      params.action === "update" ||
+      params.action === "upsert"
+    ) {
+      await processCreateUpdate(params);
+    }
+
+    // Execute the query
+    const result = await next(params);
+
+    // Handle read operations - decrypt PII after retrieval
+    if (
+      params.action === "findFirst" ||
+      params.action === "findUnique" ||
+      params.action === "findMany" ||
+      params.action === "findFirstOrThrow" ||
+      params.action === "findUniqueOrThrow"
+    ) {
+      return await processReadResult(result);
+    }
+
+    return result;
+  } catch (error) {
+    // Log error for debugging but preserve original error type
+    console.error("Encryption middleware error:", error);
+    throw error;
+  }
+};
+
+/**
+ * Utility function to clear the key cache
+ * Useful for testing and key rotation scenarios
+ */
+export function clearEncryptionKeyCache(): void {
+  keyCache.clear();
+}
+
+/**
+ * Utility function to get cache statistics
+ * @returns Object with cache information
+ */
+export function getEncryptionCacheStats(): {
+  keyCount: number;
+  keyPaths: string[];
+} {
+  return {
+    keyCount: keyCache.size,
+    keyPaths: Array.from(keyCache.keys()),
+  };
+}

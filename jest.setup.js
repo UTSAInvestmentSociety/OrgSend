@@ -14,6 +14,19 @@ jest.mock("next/navigation", () => ({
   },
 }));
 
+// Setup Node.js environment for crypto functions
+const { TextEncoder, TextDecoder } = require("util");
+global.TextEncoder = TextEncoder;
+global.TextDecoder = TextDecoder;
+
+// Mock crypto for consistent testing
+if (typeof global.crypto === "undefined") {
+  const { webcrypto } = require("crypto");
+  global.crypto = webcrypto;
+}
+
+// Individual tests will handle their own AWS mocking to avoid conflicts
+
 // Global test setup
 beforeEach(() => {
   jest.clearAllMocks();

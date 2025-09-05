@@ -1,0 +1,585 @@
+/**
+ * Database operations tests
+ * Tests encrypted field storage, retrieval, and relationships
+ */
+
+import { jest } from "@jest/globals";
+import {
+  userOperations,
+  organizationOperations,
+  followOperations,
+  messageOperations,
+} from "./operations";
+import { createUniqueConstraintHash } from "../encryption/hash";
+import { generateOrgCode } from "../utils";
+
+// Mock the database client
+const mockDb = {
+  user: {
+    findUnique: jest.fn(),
+    create: jest.fn(),
+    update: jest.fn(),
+  },
+  organization: {
+    findUnique: jest.fn(),
+    create: jest.fn(),
+  },
+  orgFollow: {
+    findMany: jest.fn(),
+    findUnique: jest.fn(),
+    create: jest.fn(),
+    update: jest.fn(),
+    count: jest.fn(),
+  },
+  orgCredit: {
+    findUnique: jest.fn(),
+    update: jest.fn(),
+    create: jest.fn(),
+  },
+  creditTransaction: {
+    create: jest.fn(),
+  },
+  message: {
+    create: jest.fn(),
+    findMany: jest.fn(),
+  },
+  $transaction: jest.fn(),
+} as any;
+
+jest.mock("./client", () => ({
+  db: mockDb,
+}));
+
+describe("Database Operations", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  describe("userOperations", () => {
+    describe("findByEmail", () => {
+      it("should find user by email using hash lookup", async () => {
+        const email = "test@example.com";
+        const emailHash = createUniqueConstraintHash(email);
+        const mockUser = { id: "user1", firstName: "John", lastName: "Doe" };
+
+        mockDb.user.findUnique.mockResolvedValue(mockUser);
+
+        const result = await userOperations.findByEmail(email);
+
+        expect(mockDb.user.findUnique).toHaveBeenCalledWith({
+          where: { email_hash: emailHash },
+        });
+        expect(result).toBe(mockUser);
+      });
+
+      it("should return null when user not found", async () => {
+        mockDb.user.findUnique.mockResolvedValue(null);
+
+        const result = await userOperations.findByEmail(
+          "nonexistent@example.com"
+        );
+
+        expect(result).toBeNull();
+      });
+    });
+
+    describe("findByPhone", () => {
+      it("should find user by phone using hash lookup", async () => {
+        const phone = "+1234567890";
+        const phoneHash = createUniqueConstraintHash(phone);
+        const mockUser = { id: "user1", firstName: "John", lastName: "Doe" };
+
+        mockDb.user.findUnique.mockResolvedValue(mockUser);
+
+        const result = await userOperations.findByPhone(phone);
+
+        expect(mockDb.user.findUnique).toHaveBeenCalledWith({
+          where: { phone_hash: phoneHash },
+        });
+        expect(result).toBe(mockUser);
+      });
+    });
+
+    describe("create", () => {
+      it("should create new user with PII encryption", async () => {
+        const userData = {
+          firstName: "Jane",
+          lastName: "Smith",
+          email: "jane@example.com",
+          phone: "+1234567890",
+          communicationPreference: "BOTH" as const,
+          passwordHash: "hashed_password",
+        };
+
+        const mockCreatedUser = { id: "user123", ...userData };
+        mockDb.user.create.mockResolvedValue(mockCreatedUser);
+
+        const result = await userOperations.create(userData);
+
+        expect(mockDb.user.create).toHaveBeenCalledWith({
+          data: userData,
+        });
+        expect(result).toBe(mockCreatedUser);
+      });
+    });
+
+    describe("verifyPhone", () => {
+      it("should mark phone as verified and clear verification data", async () => {
+        const userId = "user123";
+        const mockUpdatedUser = { id: userId, phoneVerified: true };
+
+        mockDb.user.update.mockResolvedValue(mockUpdatedUser);
+
+        const result = await userOperations.verifyPhone(userId);
+
+        expect(mockDb.user.update).toHaveBeenCalledWith({
+          where: { id: userId },
+          data: {
+            phoneVerified: true,
+            phoneVerificationCode_encrypted: null,
+            phoneVerificationCode_hash: null,
+            phoneVerificationExpires: null,
+          },
+        });
+        expect(result).toBe(mockUpdatedUser);
+      });
+    });
+
+    describe("getFollowers", () => {
+      it("should return approved followers with decrypted PII", async () => {
+        const organizationId = "org123";
+        const mockFollows = [
+          {
+            user: { id: "user1", firstName: "John", lastName: "Doe" },
+          },
+          {
+            user: { id: "user2", firstName: "Jane", lastName: "Smith" },
+          },
+        ];
+
+        mockDb.orgFollow.findMany.mockResolvedValue(mockFollows);
+
+        const result = await userOperations.getFollowers(organizationId);
+
+        expect(mockDb.orgFollow.findMany).toHaveBeenCalledWith({
+          where: {
+            organizationId,
+            status: "APPROVED",
+          },
+          include: {
+            user: true,
+          },
+        });
+        expect(result).toEqual([mockFollows[0].user, mockFollows[1].user]);
+      });
+    });
+  });
+
+  describe("organizationOperations", () => {
+    describe("findByCode", () => {
+      it("should find organization by unique code", async () => {
+        const code = "TEST1234";
+        const mockOrg = {
+          id: "org1",
+          name: "Test Organization",
+          code,
+          admin: { id: "admin1", firstName: "Admin" },
+          credits: { balance: 100 },
+        };
+
+        mockDb.organization.findUnique.mockResolvedValue(mockOrg);
+
+        const result = await organizationOperations.findByCode(code);
+
+        expect(mockDb.organization.findUnique).toHaveBeenCalledWith({
+          where: { code },
+          include: {
+            admin: true,
+            credits: true,
+          },
+        });
+        expect(result).toBe(mockOrg);
+      });
+    });
+
+    describe("create", () => {
+      it("should create organization with initial credits in transaction", async () => {
+        const orgData = {
+          name: "New Organization",
+          description: "Test org",
+          code: "NEWORG12",
+          adminId: "admin123",
+        };
+
+        const mockOrganization = { id: "org123", ...orgData };
+
+        // Mock transaction
+        mockDb.$transaction.mockImplementation(async (callback) => {
+          const mockTx = {
+            organization: {
+              create: jest.fn().mockResolvedValue(mockOrganization),
+            },
+            orgCredit: { create: jest.fn() },
+            creditTransaction: { create: jest.fn() },
+          };
+          return callback(mockTx);
+        });
+
+        const result = await organizationOperations.create(orgData);
+
+        expect(mockDb.$transaction).toHaveBeenCalled();
+        expect(result).toBe(mockOrganization);
+      });
+    });
+
+    describe("hasCredits", () => {
+      it("should return true when organization has sufficient credits", async () => {
+        const organizationId = "org123";
+        const mockCredits = { balance: 50 };
+
+        mockDb.orgCredit.findUnique.mockResolvedValue(mockCredits);
+
+        const result = await organizationOperations.hasCredits(
+          organizationId,
+          25
+        );
+
+        expect(result).toBe(true);
+        expect(mockDb.orgCredit.findUnique).toHaveBeenCalledWith({
+          where: { organizationId },
+        });
+      });
+
+      it("should return false when organization has insufficient credits", async () => {
+        const organizationId = "org123";
+        const mockCredits = { balance: 10 };
+
+        mockDb.orgCredit.findUnique.mockResolvedValue(mockCredits);
+
+        const result = await organizationOperations.hasCredits(
+          organizationId,
+          25
+        );
+
+        expect(result).toBe(false);
+      });
+
+      it("should return false when organization has no credits record", async () => {
+        mockDb.orgCredit.findUnique.mockResolvedValue(null);
+
+        const result = await organizationOperations.hasCredits("org123", 10);
+
+        expect(result).toBe(false);
+      });
+    });
+
+    describe("useCredits", () => {
+      it("should deduct credits and create transaction", async () => {
+        const organizationId = "org123";
+        const amount = 5;
+        const messageId = "msg123";
+        const adminId = "admin123";
+
+        const mockCredits = { balance: 20, totalUsed: 10 };
+
+        mockDb.$transaction.mockImplementation(async (callback) => {
+          const mockTx = {
+            orgCredit: {
+              findUnique: jest.fn().mockResolvedValue(mockCredits),
+              update: jest.fn(),
+            },
+            creditTransaction: { create: jest.fn() },
+          };
+          return callback(mockTx);
+        });
+
+        await organizationOperations.useCredits(
+          organizationId,
+          amount,
+          messageId,
+          adminId
+        );
+
+        expect(mockDb.$transaction).toHaveBeenCalled();
+      });
+
+      it("should throw error when insufficient credits", async () => {
+        const mockCredits = { balance: 2, totalUsed: 8 };
+
+        mockDb.$transaction.mockImplementation(async (callback) => {
+          const mockTx = {
+            orgCredit: {
+              findUnique: jest.fn().mockResolvedValue(mockCredits),
+            },
+          };
+          return callback(mockTx);
+        });
+
+        await expect(
+          organizationOperations.useCredits("org123", 5, "msg123", "admin123")
+        ).rejects.toThrow("Insufficient SMS credits");
+      });
+    });
+  });
+
+  describe("followOperations", () => {
+    describe("createRequest", () => {
+      it("should create follow request with pending status", async () => {
+        const userId = "user123";
+        const organizationId = "org123";
+        const joinMethod = "BROWSE";
+
+        const mockFollow = {
+          id: "follow123",
+          userId,
+          organizationId,
+          status: "PENDING",
+          joinMethod,
+        };
+
+        mockDb.orgFollow.create.mockResolvedValue(mockFollow);
+
+        const result = await followOperations.createRequest(
+          userId,
+          organizationId,
+          joinMethod
+        );
+
+        expect(mockDb.orgFollow.create).toHaveBeenCalledWith({
+          data: {
+            userId,
+            organizationId,
+            joinMethod,
+            status: "PENDING",
+          },
+        });
+        expect(result).toBe(mockFollow);
+      });
+    });
+
+    describe("approve", () => {
+      it("should approve follow request with admin tracking", async () => {
+        const followId = "follow123";
+        const adminId = "admin123";
+
+        const mockApprovedFollow = {
+          id: followId,
+          status: "APPROVED",
+          approvedByAdminId: adminId,
+        };
+
+        mockDb.orgFollow.update.mockResolvedValue(mockApprovedFollow);
+
+        const result = await followOperations.approve(followId, adminId);
+
+        expect(mockDb.orgFollow.update).toHaveBeenCalledWith({
+          where: { id: followId },
+          data: {
+            status: "APPROVED",
+            approvedAt: expect.any(Date),
+            approvedByAdminId: adminId,
+          },
+        });
+        expect(result).toBe(mockApprovedFollow);
+      });
+    });
+
+    describe("isFollowing", () => {
+      it("should return follow status when relationship exists", async () => {
+        const userId = "user123";
+        const organizationId = "org123";
+        const mockFollow = { status: "APPROVED" };
+
+        mockDb.orgFollow.findUnique.mockResolvedValue(mockFollow);
+
+        const result = await followOperations.isFollowing(
+          userId,
+          organizationId
+        );
+
+        expect(mockDb.orgFollow.findUnique).toHaveBeenCalledWith({
+          where: {
+            userId_organizationId: {
+              userId,
+              organizationId,
+            },
+          },
+        });
+        expect(result).toBe("APPROVED");
+      });
+
+      it("should return null when no relationship exists", async () => {
+        mockDb.orgFollow.findUnique.mockResolvedValue(null);
+
+        const result = await followOperations.isFollowing("user123", "org123");
+
+        expect(result).toBeNull();
+      });
+    });
+  });
+
+  describe("messageOperations", () => {
+    describe("create", () => {
+      it("should create message with calculated recipient count and credits", async () => {
+        const messageData = {
+          organizationId: "org123",
+          type: "SMS" as const,
+          content: "Test message",
+          sentByAdminId: "admin123",
+        };
+
+        const followerCount = 5;
+        mockDb.orgFollow.count.mockResolvedValue(followerCount);
+
+        const mockMessage = {
+          id: "msg123",
+          ...messageData,
+          recipientCount: followerCount,
+          creditsCalculated: 5,
+        };
+
+        mockDb.message.create.mockResolvedValue(mockMessage);
+
+        const result = await messageOperations.create(messageData);
+
+        expect(mockDb.orgFollow.count).toHaveBeenCalledWith({
+          where: {
+            organizationId: messageData.organizationId,
+            status: "APPROVED",
+          },
+        });
+
+        expect(mockDb.message.create).toHaveBeenCalledWith({
+          data: {
+            ...messageData,
+            recipientCount: followerCount,
+            creditsCalculated: 5, // SMS requires credits
+          },
+        });
+        expect(result).toBe(mockMessage);
+      });
+
+      it("should calculate zero credits for email messages", async () => {
+        const messageData = {
+          organizationId: "org123",
+          type: "EMAIL" as const,
+          subject: "Test Email",
+          content: "Test email content",
+          sentByAdminId: "admin123",
+        };
+
+        const followerCount = 3;
+        mockDb.orgFollow.count.mockResolvedValue(followerCount);
+
+        const mockMessage = {
+          id: "msg123",
+          ...messageData,
+          recipientCount: followerCount,
+          creditsCalculated: 0,
+        };
+
+        mockDb.message.create.mockResolvedValue(mockMessage);
+
+        const result = await messageOperations.create(messageData);
+
+        expect(mockDb.message.create).toHaveBeenCalledWith({
+          data: {
+            ...messageData,
+            recipientCount: followerCount,
+            creditsCalculated: 0, // Email doesn't require credits
+          },
+        });
+      });
+    });
+
+    describe("getHistory", () => {
+      it("should return organization message history with delivery data", async () => {
+        const organizationId = "org123";
+        const mockMessages = [
+          {
+            id: "msg1",
+            content: "Message 1",
+            deliveries: [{ id: "del1", status: "DELIVERED" }],
+          },
+          {
+            id: "msg2",
+            content: "Message 2",
+            deliveries: [{ id: "del2", status: "SENT" }],
+          },
+        ];
+
+        mockDb.message.findMany.mockResolvedValue(mockMessages);
+
+        const result = await messageOperations.getHistory(organizationId);
+
+        expect(mockDb.message.findMany).toHaveBeenCalledWith({
+          where: { organizationId },
+          orderBy: { createdAt: "desc" },
+          take: 50,
+          include: {
+            deliveries: {
+              select: {
+                id: true,
+                status: true,
+                deliveredAt: true,
+                failedAt: true,
+              },
+            },
+          },
+        });
+        expect(result).toBe(mockMessages);
+      });
+    });
+  });
+
+  describe("Integration Tests", () => {
+    it("should handle complete user registration workflow", async () => {
+      // Mock sequential operations for user registration
+      const email = "newuser@example.com";
+      const phone = "+1555123456";
+
+      // First check if user exists (should return null)
+      mockDb.user.findUnique.mockResolvedValueOnce(null);
+      mockDb.user.findUnique.mockResolvedValueOnce(null);
+
+      // Then create user
+      const mockCreatedUser = {
+        id: "user123",
+        firstName: "New",
+        lastName: "User",
+        email,
+        phone,
+        phoneVerified: false,
+      };
+      mockDb.user.create.mockResolvedValue(mockCreatedUser);
+
+      // Test the workflow
+      const existingUserByEmail = await userOperations.findByEmail(email);
+      const existingUserByPhone = await userOperations.findByPhone(phone);
+
+      expect(existingUserByEmail).toBeNull();
+      expect(existingUserByPhone).toBeNull();
+
+      const newUser = await userOperations.create({
+        firstName: "New",
+        lastName: "User",
+        email,
+        phone,
+        passwordHash: "hashed_password",
+        communicationPreference: "BOTH",
+      });
+
+      expect(newUser).toBe(mockCreatedUser);
+      expect(mockDb.user.create).toHaveBeenCalledWith({
+        data: {
+          firstName: "New",
+          lastName: "User",
+          email,
+          phone,
+          passwordHash: "hashed_password",
+          communicationPreference: "BOTH",
+        },
+      });
+    });
+  });
+});

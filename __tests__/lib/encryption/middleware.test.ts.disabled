@@ -1,0 +1,566 @@
+/**
+ * Unit tests for Prisma middleware encryption/decryption
+ * Mocks Prisma operations and AWS Secrets Manager
+ */
+
+import { jest } from "@jest/globals";
+import { Prisma } from "@prisma/client";
+import {
+  encryptionMiddleware,
+  clearEncryptionKeyCache,
+  getEncryptionCacheStats,
+} from "./middleware";
+import { generateEncryptionKey } from "./crypto";
+import { ENCRYPTION_KEY_PATHS, PII_FIELD_MAPPINGS } from "./types";
+
+// Mock the keys module
+const mockGetNamesKey = jest.fn();
+const mockGetPhoneKey = jest.fn();
+const mockGetEmailKey = jest.fn();
+
+jest.mock("./keys", () => ({
+  getNamesKey: mockGetNamesKey,
+  getPhoneKey: mockGetPhoneKey,
+  getEmailKey: mockGetEmailKey,
+}));
+
+describe("Encryption Middleware", () => {
+  const mockKeys = {
+    names: generateEncryptionKey(),
+    phone: generateEncryptionKey(),
+    email: generateEncryptionKey(),
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    clearEncryptionKeyCache();
+
+    // Setup mock key responses
+    mockGetNamesKey.mockResolvedValue({
+      key: mockKeys.names,
+      keyId: "names-key-id",
+      version: 1,
+    });
+
+    mockGetPhoneKey.mockResolvedValue({
+      key: mockKeys.phone,
+      keyId: "phone-key-id",
+      version: 1,
+    });
+
+    mockGetEmailKey.mockResolvedValue({
+      key: mockKeys.email,
+      keyId: "email-key-id",
+      version: 1,
+    });
+  });
+
+  afterEach(() => {
+    clearEncryptionKeyCache();
+  });
+
+  describe("create operations", () => {
+    it("encrypts PII fields on create operation", async () => {
+      const mockNext = jest.fn().mockResolvedValue({ id: "test-id" });
+
+      const params: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "create",
+        args: {
+          data: {
+            firstName: "John",
+            lastName: "Doe",
+            email: "john@example.com",
+            phone: "+1234567890",
+            nonPIIField: "not encrypted",
+          },
+        },
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      const result = await encryptionMiddleware(params, mockNext);
+
+      // Check that PII fields were removed from original data
+      expect(params.args.data.firstName).toBeUndefined();
+      expect(params.args.data.lastName).toBeUndefined();
+      expect(params.args.data.email).toBeUndefined();
+      expect(params.args.data.phone).toBeUndefined();
+
+      // Check that encrypted and hash fields were added
+      expect(params.args.data.firstName_encrypted).toBeDefined();
+      expect(params.args.data.firstName_hash).toBeDefined();
+      expect(params.args.data.lastName_encrypted).toBeDefined();
+      expect(params.args.data.lastName_hash).toBeDefined();
+      expect(params.args.data.email_encrypted).toBeDefined();
+      expect(params.args.data.email_hash).toBeDefined();
+      expect(params.args.data.phone_encrypted).toBeDefined();
+      expect(params.args.data.phone_hash).toBeDefined();
+
+      // Non-PII fields should remain unchanged
+      expect(params.args.data.nonPIIField).toBe("not encrypted");
+
+      // Check that encrypted values are valid JSON strings
+      const emailEncrypted = JSON.parse(params.args.data.email_encrypted);
+      expect(emailEncrypted).toHaveProperty("data");
+      expect(emailEncrypted).toHaveProperty("iv");
+      expect(emailEncrypted).toHaveProperty("tag");
+
+      expect(result).toEqual({ id: "test-id" });
+      expect(mockNext).toHaveBeenCalledWith(params);
+    });
+
+    it("handles partial PII data on create", async () => {
+      const mockNext = jest.fn().mockResolvedValue({ id: "test-id" });
+
+      const params: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "create",
+        args: {
+          data: {
+            firstName: "John",
+            email: "john@example.com",
+            // lastName and phone are missing
+            nonPIIField: "not encrypted",
+          },
+        },
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      await encryptionMiddleware(params, mockNext);
+
+      // Only provided PII fields should be encrypted
+      expect(params.args.data.firstName_encrypted).toBeDefined();
+      expect(params.args.data.firstName_hash).toBeDefined();
+      expect(params.args.data.email_encrypted).toBeDefined();
+      expect(params.args.data.email_hash).toBeDefined();
+
+      // Missing PII fields should not have encrypted counterparts
+      expect(params.args.data.lastName_encrypted).toBeUndefined();
+      expect(params.args.data.lastName_hash).toBeUndefined();
+      expect(params.args.data.phone_encrypted).toBeUndefined();
+      expect(params.args.data.phone_hash).toBeUndefined();
+    });
+
+    it("skips encryption when no PII fields present", async () => {
+      const mockNext = jest.fn().mockResolvedValue({ id: "test-id" });
+
+      const originalData = {
+        nonPIIField1: "value1",
+        nonPIIField2: "value2",
+      };
+
+      const params: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "create",
+        args: {
+          data: { ...originalData },
+        },
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      await encryptionMiddleware(params, mockNext);
+
+      // Data should remain unchanged
+      expect(params.args.data).toEqual(originalData);
+
+      // No key retrieval should have occurred
+      expect(mockGetNamesKey).not.toHaveBeenCalled();
+      expect(mockGetPhoneKey).not.toHaveBeenCalled();
+      expect(mockGetEmailKey).not.toHaveBeenCalled();
+    });
+
+    it("handles empty or invalid data gracefully", async () => {
+      const mockNext = jest.fn().mockResolvedValue({ id: "test-id" });
+
+      const testCases = [
+        { data: null },
+        { data: undefined },
+        { data: {} },
+        { data: { firstName: "" } }, // Empty string
+        { data: { firstName: null } }, // Null value
+      ];
+
+      for (const testCase of testCases) {
+        const params: Prisma.MiddlewareParams = {
+          model: "User",
+          action: "create",
+          args: testCase,
+          dataPath: [],
+          runInTransaction: false,
+        };
+
+        // Should not throw
+        await expect(
+          encryptionMiddleware(params, mockNext)
+        ).resolves.not.toThrow();
+      }
+    });
+  });
+
+  describe("update operations", () => {
+    it("encrypts PII fields on update operation", async () => {
+      const mockNext = jest.fn().mockResolvedValue({ id: "test-id" });
+
+      const params: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "update",
+        args: {
+          where: { id: "test-id" },
+          data: {
+            firstName: "Jane",
+            email: "jane@example.com",
+          },
+        },
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      await encryptionMiddleware(params, mockNext);
+
+      expect(params.args.data.firstName).toBeUndefined();
+      expect(params.args.data.email).toBeUndefined();
+      expect(params.args.data.firstName_encrypted).toBeDefined();
+      expect(params.args.data.firstName_hash).toBeDefined();
+      expect(params.args.data.email_encrypted).toBeDefined();
+      expect(params.args.data.email_hash).toBeDefined();
+    });
+
+    it("handles upsert operations", async () => {
+      const mockNext = jest.fn().mockResolvedValue({ id: "test-id" });
+
+      const params: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "upsert",
+        args: {
+          where: { id: "test-id" },
+          create: {
+            firstName: "John",
+            email: "john@example.com",
+          },
+          update: {
+            firstName: "Jane",
+          },
+        },
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      await encryptionMiddleware(params, mockNext);
+
+      // Both create and update data should be encrypted
+      expect(params.args.create.firstName_encrypted).toBeDefined();
+      expect(params.args.create.email_encrypted).toBeDefined();
+      expect(params.args.update.firstName_encrypted).toBeDefined();
+    });
+  });
+
+  describe("read operations", () => {
+    const createEncryptedData = async (plainData: any) => {
+      const mockNext = jest.fn().mockResolvedValue(plainData);
+      const createParams: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "create",
+        args: { data: { ...plainData } },
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      await encryptionMiddleware(createParams, mockNext);
+      return createParams.args.data;
+    };
+
+    it("decrypts PII fields on findUnique operation", async () => {
+      const plainData = {
+        firstName: "John",
+        lastName: "Doe",
+        email: "john@example.com",
+      };
+
+      const encryptedData = await createEncryptedData(plainData);
+
+      const mockNext = jest.fn().mockResolvedValue({
+        id: "test-id",
+        ...encryptedData,
+      });
+
+      const params: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "findUnique",
+        args: { where: { id: "test-id" } },
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      const result = await encryptionMiddleware(params, mockNext);
+
+      expect(result.firstName).toBe("John");
+      expect(result.lastName).toBe("Doe");
+      expect(result.email).toBe("john@example.com");
+    });
+
+    it("decrypts PII fields on findFirst operation", async () => {
+      const plainData = {
+        firstName: "Jane",
+        email: "jane@example.com",
+      };
+
+      const encryptedData = await createEncryptedData(plainData);
+
+      const mockNext = jest.fn().mockResolvedValue({
+        id: "test-id",
+        ...encryptedData,
+      });
+
+      const params: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "findFirst",
+        args: { where: { id: "test-id" } },
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      const result = await encryptionMiddleware(params, mockNext);
+
+      expect(result.firstName).toBe("Jane");
+      expect(result.email).toBe("jane@example.com");
+    });
+
+    it("decrypts PII fields on findMany operation", async () => {
+      const plainData1 = { firstName: "John", email: "john@example.com" };
+      const plainData2 = { firstName: "Jane", email: "jane@example.com" };
+
+      const encryptedData1 = await createEncryptedData(plainData1);
+      const encryptedData2 = await createEncryptedData(plainData2);
+
+      const mockNext = jest.fn().mockResolvedValue([
+        { id: "test-id-1", ...encryptedData1 },
+        { id: "test-id-2", ...encryptedData2 },
+      ]);
+
+      const params: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "findMany",
+        args: {},
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      const result = await encryptionMiddleware(params, mockNext);
+
+      expect(result).toHaveLength(2);
+      expect(result[0].firstName).toBe("John");
+      expect(result[0].email).toBe("john@example.com");
+      expect(result[1].firstName).toBe("Jane");
+      expect(result[1].email).toBe("jane@example.com");
+    });
+
+    it("handles null/empty results gracefully", async () => {
+      const testCases = [null, undefined, [], {}];
+
+      for (const testResult of testCases) {
+        const mockNext = jest.fn().mockResolvedValue(testResult);
+        const params: Prisma.MiddlewareParams = {
+          model: "User",
+          action: "findFirst",
+          args: { where: { id: "nonexistent" } },
+          dataPath: [],
+          runInTransaction: false,
+        };
+
+        const result = await encryptionMiddleware(params, mockNext);
+        expect(result).toBe(testResult);
+      }
+    });
+
+    it("handles decryption errors gracefully", async () => {
+      const mockNext = jest.fn().mockResolvedValue({
+        id: "test-id",
+        firstName_encrypted: "invalid-encrypted-data",
+        firstName_hash: "some-hash",
+      });
+
+      const params: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "findFirst",
+        args: { where: { id: "test-id" } },
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      // Should not throw, but set field to null
+      const result = await encryptionMiddleware(params, mockNext);
+      expect(result.firstName).toBeNull();
+    });
+
+    it("enforces batch size limits for findMany", async () => {
+      const largeResult = Array(26)
+        .fill(null)
+        .map((_, index) => ({
+          id: `test-id-${index}`,
+          firstName_encrypted: JSON.stringify({
+            data: "test",
+            iv: "test",
+            tag: "test",
+          }),
+        }));
+
+      const mockNext = jest.fn().mockResolvedValue(largeResult);
+
+      const params: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "findMany",
+        args: {},
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      await expect(encryptionMiddleware(params, mockNext)).rejects.toThrow(
+        "Result set too large for decryption"
+      );
+    });
+  });
+
+  describe("key caching", () => {
+    it("caches encryption keys across operations", async () => {
+      const mockNext = jest.fn().mockResolvedValue({ id: "test-id" });
+
+      // First operation
+      const params1: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "create",
+        args: {
+          data: {
+            firstName: "John",
+            email: "john@example.com",
+          },
+        },
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      await encryptionMiddleware(params1, mockNext);
+
+      // Second operation with same field types
+      const params2: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "create",
+        args: {
+          data: {
+            firstName: "Jane",
+            email: "jane@example.com",
+          },
+        },
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      await encryptionMiddleware(params2, mockNext);
+
+      // Keys should have been retrieved only once due to caching
+      expect(mockGetNamesKey).toHaveBeenCalledTimes(1);
+      expect(mockGetEmailKey).toHaveBeenCalledTimes(1);
+
+      const cacheStats = getEncryptionCacheStats();
+      expect(cacheStats.keyCount).toBe(2);
+      expect(cacheStats.keyPaths).toContain(ENCRYPTION_KEY_PATHS.NAMES);
+      expect(cacheStats.keyPaths).toContain(ENCRYPTION_KEY_PATHS.EMAIL);
+    });
+
+    it("clearEncryptionKeyCache clears the cache", async () => {
+      const mockNext = jest.fn().mockResolvedValue({ id: "test-id" });
+
+      const params: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "create",
+        args: {
+          data: { firstName: "John" },
+        },
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      await encryptionMiddleware(params, mockNext);
+      expect(getEncryptionCacheStats().keyCount).toBe(1);
+
+      clearEncryptionKeyCache();
+      expect(getEncryptionCacheStats().keyCount).toBe(0);
+    });
+  });
+
+  describe("non-encryption operations", () => {
+    it("passes through non-create/update/read operations unchanged", async () => {
+      const mockNext = jest.fn().mockResolvedValue({ count: 5 });
+
+      const nonEncryptionOperations = [
+        "delete",
+        "deleteMany",
+        "count",
+        "aggregate",
+      ];
+
+      for (const operation of nonEncryptionOperations) {
+        const params: Prisma.MiddlewareParams = {
+          model: "User",
+          action: operation as any,
+          args: { where: { id: "test" } },
+          dataPath: [],
+          runInTransaction: false,
+        };
+
+        const result = await encryptionMiddleware(params, mockNext);
+        expect(result).toEqual({ count: 5 });
+        expect(mockNext).toHaveBeenCalledWith(params);
+      }
+
+      // No encryption keys should have been requested
+      expect(mockGetNamesKey).not.toHaveBeenCalled();
+      expect(mockGetPhoneKey).not.toHaveBeenCalled();
+      expect(mockGetEmailKey).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("error handling", () => {
+    it("propagates errors from next middleware", async () => {
+      const dbError = new Error("Database connection failed");
+      const mockNext = jest.fn().mockRejectedValue(dbError);
+
+      const params: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "create",
+        args: {
+          data: { firstName: "John" },
+        },
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      await expect(encryptionMiddleware(params, mockNext)).rejects.toThrow(
+        "Database connection failed"
+      );
+    });
+
+    it("propagates encryption key retrieval errors", async () => {
+      const keyError = new Error("Failed to retrieve encryption key");
+      mockGetNamesKey.mockRejectedValue(keyError);
+
+      const mockNext = jest.fn().mockResolvedValue({ id: "test-id" });
+
+      const params: Prisma.MiddlewareParams = {
+        model: "User",
+        action: "create",
+        args: {
+          data: { firstName: "John" },
+        },
+        dataPath: [],
+        runInTransaction: false,
+      };
+
+      await expect(encryptionMiddleware(params, mockNext)).rejects.toThrow(
+        "Failed to retrieve encryption key"
+      );
+    });
+  });
+});

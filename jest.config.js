@@ -13,13 +13,25 @@ const config = {
   moduleNameMapper: {
     "^@/(.*)$": "<rootDir>/src/$1",
   },
-  testPathIgnorePatterns: ["<rootDir>/.next/", "<rootDir>/node_modules/"],
+  testPathIgnorePatterns: [
+    "<rootDir>/.next/", 
+    "<rootDir>/node_modules/",
+    "<rootDir>/__tests__/archives/"
+  ],
+  // Explicitly include test directories
+  testMatch: [
+    "<rootDir>/__tests__/**/*.{js,jsx,ts,tsx}",
+    "<rootDir>/__tests__/**/*.test.{js,jsx,ts,tsx}",
+    "<rootDir>/__tests__/**/*.spec.{js,jsx,ts,tsx}",
+  ],
   collectCoverageFrom: [
     "src/**/*.{js,jsx,ts,tsx}",
     "!src/**/*.d.ts",
     "!src/types/**/*",
   ],
   passWithNoTests: true,
+  // Load test environment variables
+  setupFiles: ["<rootDir>/jest.env.js"],
 };
 
 // createJestConfig is exported this way to ensure that next/jest can load the Next.js config which is async

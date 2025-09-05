@@ -1,0 +1,166 @@
+import { db as prisma } from "./src/lib/database/client";
+
+async function testDatabaseWithEncryption() {
+  console.log("🗄️ Testing Database Operations with Encryption");
+  console.log("==============================================");
+
+  try {
+    // Connect to database
+    await prisma.$connect();
+    console.log("✅ Connected to database");
+
+    // Test 1: Create a user with PII data
+    console.log("\n1. Testing user creation with encrypted PII...");
+    const testUser = await prisma.user.create({
+      data: {
+        firstName: "TestUser",
+        lastName: "Encryption",
+        email: "test@encryption.edu",
+        phone: "+15551234567",
+        userType: "STUDENT",
+        communicationPreference: "BOTH",
+      },
+    });
+
+    console.log(`✅ Created user: ${testUser.firstName} ${testUser.lastName}`);
+    console.log(`   Email: ${testUser.email}`);
+    console.log(`   Phone: ${testUser.phone}`);
+    console.log(`   ID: ${testUser.id}`);
+
+    // Test 2: Verify raw storage shows encrypted data
+    console.log("\n2. Checking raw database storage...");
+    const rawData = await prisma.$queryRaw`
+      SELECT id, firstName_encrypted, firstName_hash, email_encrypted, email_hash
+      FROM "User" WHERE id = ${testUser.id}
+    `;
+
+    if (rawData && Array.isArray(rawData) && rawData.length > 0) {
+      const raw = rawData[0] as any;
+      console.log("✅ Raw storage verification:");
+      console.log(
+        `   firstName_encrypted: ${raw.firstName_encrypted ? "Present" : "Missing"}`
+      );
+      console.log(
+        `   firstName_hash: ${raw.firstName_hash ? raw.firstName_hash.substring(0, 16) + "..." : "Missing"}`
+      );
+      console.log(
+        `   email_encrypted: ${raw.email_encrypted ? "Present" : "Missing"}`
+      );
+      console.log(
+        `   email_hash: ${raw.email_hash ? raw.email_hash.substring(0, 16) + "..." : "Missing"}`
+      );
+
+      // Check if plaintext is stored (it shouldn't be)
+      const rawString = JSON.stringify(raw);
+      const hasPlaintext =
+        rawString.includes("TestUser") ||
+        rawString.includes("test@encryption.edu");
+
+      if (!hasPlaintext) {
+        console.log("✅ Plaintext data properly encrypted in storage");
+      } else {
+        console.log(
+          "❌ Plaintext data found in storage - encryption may be failing"
+        );
+      }
+    }
+
+    // Test 3: Test retrieval and decryption
+    console.log("\n3. Testing data retrieval and decryption...");
+    const retrievedUser = await prisma.user.findUnique({
+      where: { id: testUser.id },
+    });
+
+    if (retrievedUser) {
+      console.log(
+        `✅ Retrieved and decrypted: ${retrievedUser.firstName} ${retrievedUser.lastName}`
+      );
+      console.log(`   Email: ${retrievedUser.email}`);
+      console.log(`   Phone: ${retrievedUser.phone}`);
+
+      // Verify data matches
+      const dataMatches =
+        retrievedUser.firstName === "TestUser" &&
+        retrievedUser.lastName === "Encryption" &&
+        retrievedUser.email === "test@encryption.edu" &&
+        retrievedUser.phone === "+15551234567";
+
+      if (dataMatches) {
+        console.log("✅ All decrypted data matches original input");
+      } else {
+        console.log("❌ Decrypted data does not match original input");
+      }
+    }
+
+    // Test 4: Test search by encrypted field
+    console.log("\n4. Testing search by encrypted email field...");
+    const foundUser = await prisma.user.findFirst({
+      where: { email: "test@encryption.edu" },
+    });
+
+    if (foundUser && foundUser.id === testUser.id) {
+      console.log("✅ Successfully found user by encrypted email field");
+    } else {
+      console.log("❌ Failed to find user by encrypted email field");
+    }
+
+    // Test 5: Create organization
+    console.log("\n5. Testing organization creation...");
+    const testOrg = await prisma.organization.create({
+      data: {
+        name: "Test Organization",
+        description: "Testing encryption system",
+        category: "ACADEMIC",
+        contactEmail: "admin@testorg.edu",
+        isPublic: true,
+        maxMembers: 50,
+      },
+    });
+
+    console.log(`✅ Created organization: ${testOrg.name} (ID: ${testOrg.id})`);
+
+    // Test 6: Create subgroup
+    console.log("\n6. Testing subgroup creation...");
+    const testSubgroup = await prisma.subgroup.create({
+      data: {
+        name: "Test Subgroup",
+        description: "Testing subgroup functionality",
+        organizationId: testOrg.id,
+        maxMembers: 25,
+      },
+    });
+
+    console.log(
+      `✅ Created subgroup: ${testSubgroup.name} (ID: ${testSubgroup.id})`
+    );
+
+    // Cleanup
+    console.log("\n7. Cleaning up test data...");
+    await prisma.subgroup.delete({ where: { id: testSubgroup.id } });
+    await prisma.organization.delete({ where: { id: testOrg.id } });
+    await prisma.user.delete({ where: { id: testUser.id } });
+    console.log("✅ Cleaned up all test data");
+
+    console.log("\n🎉 Database encryption test completed successfully!");
+    return { success: true };
+  } catch (error) {
+    console.error("\n❌ Database encryption test failed:");
+    console.error(error);
+    return { success: false, error };
+  } finally {
+    await prisma.$disconnect();
+    console.log("✅ Disconnected from database");
+  }
+}
+
+// Run the test
+testDatabaseWithEncryption()
+  .then((result) => {
+    if (!result.success) {
+      process.exit(1);
+    }
+  })
+  .catch((error) => {
+    console.error("Test execution failed:", error);
+    process.exit(1);
+  });

@@ -49,3 +49,4 @@ PROJECT_STATUS.md
 .env
 P2_STATUS.md
 .env.test
+__tests__/*
